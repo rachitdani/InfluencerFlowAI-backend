@@ -65,6 +65,11 @@ class Creator(BaseModel):
     location: str
     description: str
 
+class CreatorSearchRequest(BaseModel):
+    query: str
+    campaign_id: str
+
+
 class OutreachRequest(BaseModel):
     campaign_id: str
     creator_id: str
@@ -291,55 +296,10 @@ async def delete_campaign(campaign_id: str):
 @app.get("/api/creators", response_model=List[Creator])
 async def get_creators(
     category: Optional[str] = None,
-    platform: Optional[str] = None,
-    min_followers: Optional[int] = None
+    platform: Optional[str] = None
 ):
     """Get list of creators with optional filters"""
     creators_data = await get_creators_from_db(category, platform)
-    
-    # If no creators in database, return mock data
-    if not creators_data:
-        mock_creators = [
-            {
-                "id": str(uuid.uuid4()),
-                "name": "Emma Rodriguez",
-                "handle": "@emmasstyle",
-                "platform": "Instagram",
-                "followers": "125K",
-                "engagement": "4.2%",
-                "category": "Fashion",
-                "location": "Los Angeles, CA",
-                "description": "Fashion & lifestyle creator with authentic voice and high engagement"
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "name": "Marcus Chen",
-                "handle": "@techbymarcus",
-                "platform": "YouTube",
-                "followers": "89K",
-                "engagement": "6.1%",
-                "category": "Technology",
-                "location": "San Francisco, CA",
-                "description": "Tech reviews and tutorials with engaged community"
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "name": "Sofia Martinez",
-                "handle": "@sofiafitness",
-                "platform": "TikTok",
-                "followers": "245K",
-                "engagement": "8.7%",
-                "category": "Fitness",
-                "location": "Miami, FL",
-                "description": "Fitness motivation and workout routines"
-            }
-        ]
-        
-        # Insert mock creators into database
-        for creator_data in mock_creators:
-            await create_creator_in_db(creator_data)
-        
-        creators_data = mock_creators
     
     return [Creator(**creator) for creator in creators_data]
 
@@ -366,19 +326,213 @@ async def delete_creator(creator_id: str):
     await delete_creator_from_db(creator_id)
     return {"message": "Creator deleted successfully"}
 
+
 @app.post("/api/creators/search")
-async def ai_search_creators(query: str, campaign_id: str):
-    """AI-powered semantic search for creators"""
-    # Simulate embedding search
-    await asyncio.sleep(1)  # Simulate processing time
+async def ai_search_creators(request: CreatorSearchRequest):
+    """Advanced AI-powered semantic search for optimal creators"""
+    campaign_id = request.campaign_id
+    query = request.query
+    # Get campaign details for context
+    campaign_data = await get_campaign_from_db(campaign_id)
+    if not campaign_data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
     
-    # Return filtered results based on query
-    creators = await get_creators()
-    return {
-        "results": creators,
-        "query_processed": query,
-        "semantic_matches": ["fashion", "lifestyle", "authentic"]
-    }
+    # Get all available creators
+    all_creators = await get_creators_from_db()
+    if not all_creators:
+        return {
+            "results": [],
+            "query_processed": query,
+            "semantic_matches": []
+        }
+    
+    try:
+        # Prepare all creators data for single LLM call
+        creators_text = ""
+        for idx, creator in enumerate(all_creators):
+            creators_text += f"""
+            Creator {idx + 1}:
+            - Name: {creator['name']}
+            - Handle: {creator['handle']}
+            - Platform: {creator['platform']}
+            - Followers: {creator['followers']}
+            - Engagement: {creator['engagement']}
+            - Category: {creator['category']}
+            - Location: {creator['location']}
+            - Description: {creator['description']}
+            """
+        
+        # Single comprehensive LLM call for everything
+        comprehensive_prompt = f"""
+        You are an elite influencer marketing AI analyst. Analyze this campaign and score ALL creators in a single response.
+        
+        CAMPAIGN DETAILS:
+        - Title: {campaign_data['title']}
+        - Brief: {campaign_data.get('enhanced_brief', campaign_data['brief'])}
+        - Target Audience: {campaign_data['audience']}
+        - Platforms: {', '.join(campaign_data['platforms'])}
+        - Budget: {campaign_data['budget']}
+        - Search Query: {query}
+        
+        CREATORS TO ANALYZE:
+        {creators_text}
+        
+        SCORING CRITERIA (Total 100 points):
+        1. Audience Alignment (0-25): How well their audience matches target demographics
+        2. Content Relevance (0-25): Alignment with content themes and industry vertical
+        3. Platform Optimization (0-20): Platform expertise and content format mastery
+        4. Engagement Quality (0-15): Authentic engagement vs follower count ratio
+        5. Brand Safety (0-10): Professional reputation and content appropriateness
+        6. Geographic Relevance (0-5): Location alignment with campaign needs
+        
+        ADDITIONAL SCORING FACTORS:
+        - Growth Potential Bonus: High (+10), Medium (+5), Low (0)
+        - Collaboration Fit Bonus: Excellent (+15), Good (+10), Fair (+5), Poor (0)
+        - Performance Bonus: Above Average (+8), Average (+4), Below Average (0)
+        - Risk Penalty: -3 per risk factor
+        
+        Return a JSON object with this EXACT structure:
+        {{
+            "campaign_requirements": {{
+                "target_demographics": ["demographic1", "demographic2"],
+                "content_style": ["style1", "style2"],
+                "industry_vertical": "primary industry",
+                "platform_priorities": ["platform1", "platform2"],
+                "content_themes": ["theme1", "theme2", "theme3"]
+            }},
+            "creator_scores": [
+                {{
+                    "creator_index": 0,
+                    "match_score": 85,
+                    "detailed_scores": {{
+                        "audience_alignment": 22,
+                        "content_relevance": 20,
+                        "platform_optimization": 18,
+                        "engagement_quality": 14,
+                        "brand_safety": 8,
+                        "geographic_relevance": 3
+                    }},
+                    "bonuses": {{
+                        "growth_potential": 10,
+                        "collaboration_fit": 15,
+                        "performance": 8
+                    }},
+                    "penalties": {{
+                        "risk_factors": 0
+                    }},
+                    "strengths": ["strength1", "strength2"],
+                    "collaboration_fit": "excellent",
+                    "growth_potential": "high",
+                    "estimated_performance": "above_average",
+                    "risk_factors": [],
+                    "optimal_content_types": ["content_type1", "content_type2"]
+                }}
+            ],
+            "semantic_matches": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"]
+        }}
+        
+        IMPORTANT: 
+        - Score ALL creators provided (creator_index 0 to {len(all_creators)-1})
+        - Calculate match_score as: base_score + bonuses - penalties (max 100)
+        - Include 5-7 semantic keywords that represent the search intent
+        - Ensure valid JSON format
+        """
+        
+        # Single LLM call
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a precise influencer analytics AI. Always return valid JSON only. No explanations or additional text."},
+                {"role": "user", "content": comprehensive_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=4000  # Increased for comprehensive analysis
+        )
+        
+        import json
+        analysis_result = json.loads(response.choices[0].message.content.strip())
+        
+        # Process results and combine with creator data
+        scored_creators = []
+        creator_scores = analysis_result.get("creator_scores", [])
+        
+        for score_data in creator_scores:
+            creator_idx = score_data.get("creator_index")
+            if creator_idx < len(all_creators):
+                creator_with_score = all_creators[creator_idx].copy()
+                creator_with_score["match_score"] = score_data.get("match_score", 50)
+                
+                # Optional: Add additional analysis data if needed
+                creator_with_score["ai_insights"] = {
+                    "strengths": score_data.get("strengths", []),
+                    "collaboration_fit": score_data.get("collaboration_fit", "fair"),
+                    "growth_potential": score_data.get("growth_potential", "medium"),
+                    "optimal_content_types": score_data.get("optimal_content_types", [])
+                }
+                
+                scored_creators.append(creator_with_score)
+        
+        # Sort by match_score (highest first)
+        scored_creators.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+        
+        # Get semantic matches from analysis
+        semantic_matches = analysis_result.get("semantic_matches", [])
+        
+        return {
+            "results": scored_creators,
+            "query_processed": query,
+            "semantic_matches": semantic_matches
+        }
+        
+    except Exception as e:
+        print(f"Single LLM call failed: {str(e)}")
+        
+        # Enhanced fallback with multi-criteria matching
+        query_words = set(query.lower().split())
+        campaign_words = set((
+            campaign_data['title'] + " " + 
+            campaign_data.get('enhanced_brief', campaign_data['brief']) + " " +
+            campaign_data['audience'] + " " +
+            " ".join(campaign_data['platforms'])
+        ).lower().split())
+        
+        scored_creators = []
+        for creator in all_creators:
+            creator_text = (
+                creator['name'] + " " + 
+                creator['description'] + " " + 
+                creator['category'] + " " + 
+                creator['platform'] + " " +
+                creator['location']
+            ).lower()
+            
+            creator_words = set(creator_text.split())
+            
+            # Calculate multiple match scores
+            exact_matches = len(query_words.intersection(creator_words))
+            campaign_matches = len(campaign_words.intersection(creator_words))
+            platform_match = 1 if creator['platform'].lower() in [p.lower() for p in campaign_data['platforms']] else 0
+            
+            total_match_score = (exact_matches * 3) + (campaign_matches * 2) + (platform_match * 5)
+            
+            if total_match_score > 0:
+                creator_with_score = creator.copy()
+                creator_with_score["match_score"] = min(100, total_match_score * 5)
+                scored_creators.append(creator_with_score)
+        
+        # Sort by match score
+        scored_creators.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+        
+        fallback_semantic = list(set([
+            *query.lower().split()[:2],
+            *[c['category'] for c in scored_creators[:3]]
+        ]))[:5]
+        
+        return {
+            "results": scored_creators[:15],
+            "query_processed": query,
+            "semantic_matches": fallback_semantic
+        }
 
 # 3. AI OUTREACH ROUTES
 @app.post("/api/outreach", response_model=OutreachResponse)
