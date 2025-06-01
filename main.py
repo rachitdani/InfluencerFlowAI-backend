@@ -9,6 +9,9 @@ from supabase import create_client
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
+import requests
+import json
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
@@ -21,6 +24,7 @@ ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 app = FastAPI(title="CreatorFlow AI Backend", version="1.0.0")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -82,7 +86,7 @@ class NegotiationMessage(BaseModel):
     campaign_id: str
     creator_id: str
     message: str
-    sender: str  # 'brand' or 'creator'
+    sender: str 
 
 class DealRequest(BaseModel):
     campaign_id: str
@@ -94,6 +98,15 @@ class DealRequest(BaseModel):
 
 class ContractRequest(BaseModel):
     deal_id: str
+
+
+class SimpleOutreachRequest(BaseModel):
+    campaign_id: str
+    creator_id: str
+
+class SimpleOutreachResponse(BaseModel):
+    email_content: str
+    audio_url: str
 
 # Helper functions for Supabase operations
 async def create_campaign_in_db(campaign_data: dict):
@@ -207,6 +220,138 @@ async def delete_deal_from_db(deal_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+async def generate_simple_voice_message(text: str, campaign_id: str, creator_id: str) -> str:
+    """Generate voice message using ElevenLabs API"""
+    try:
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVENLABS_API_KEY
+        }
+        
+        # Voice settings
+        voice_settings = {
+            "stability": 0.75,
+            "similarity_boost": 0.8,
+            "style": 0.2,
+            "use_speaker_boost": True
+        }
+        
+        # Use a professional voice
+        voice_id = "21m00Tcm4TlvDq8ikWAM" 
+        
+        data = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": voice_settings
+        }
+        
+        response = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            json=data,
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            # Save audio file
+            audio_filename = f"outreach_{campaign_id}_{creator_id}_{int(datetime.now().timestamp())}.mp3"
+            audio_dir = "static/audio"
+            os.makedirs(audio_dir, exist_ok=True)
+            audio_path = os.path.join(audio_dir, audio_filename)
+            
+            with open(audio_path, "wb") as f:
+                f.write(response.content)
+            
+            return f"/api/audio/{audio_filename}"
+        else:
+            print(f"ElevenLabs API error: {response.status_code} - {response.text}")
+            return f"/api/audio/fallback_{campaign_id}_{creator_id}.mp3"
+            
+    except Exception as e:
+        print(f"Voice generation error: {str(e)}")
+        return f"/api/audio/fallback_{campaign_id}_{creator_id}.mp3"
+
+async def generate_simple_outreach_content(campaign_data: dict, creator_data: dict) -> tuple:
+    """Generate simple outreach content using GPT-4"""
+    
+    platform_text = ", ".join(campaign_data["platforms"]) if len(campaign_data["platforms"]) > 1 else campaign_data["platforms"][0]
+    prompt = f"""
+    Create a personalized outreach email for an influencer collaboration.
+
+    
+    CAMPAIGN:
+    - Title: {campaign_data['title']}
+    - Brief: {campaign_data.get('enhanced_brief', campaign_data['brief'])}
+    - Target Audience: {campaign_data['audience']}
+    - Platforms: {platform_text}
+    - Budget: {campaign_data['budget']} INR make it 50% of the budget
+    
+    CREATOR:
+    - Name: {creator_data['name']}
+    - Handle: {creator_data['handle']}
+    - Platform: {creator_data['platform']}
+    - Followers: {creator_data['followers']}
+    - Category: {creator_data['category']}
+    - Location: {creator_data['location']}
+    
+    Create:
+    1. A professional email with subject line do not include any signature or closing in the email just greet with a thank you
+    2. A shorter voice message script for about 40 seconds when spoken
+    
+    Make it personal, professional, and engaging.
+    
+    Return as JSON:
+    {{
+        "email_content": "full email with subject line",
+        "voice_script": "shorter version for voice message"
+    }}
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are an expert at writing personalized outreach emails for influencer marketing. Always return valid JSON only."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        result = json.loads(response.choices[0].message.content.strip())
+        
+        return result.get("email_content", ""), result.get("voice_script", "")
+        
+    except Exception as e:
+        print(f"GPT-4 outreach generation error: {str(e)}")
+        
+        # Fallback email
+        fallback_email = f"""Subject: Collaboration Opportunity - {campaign_data['title']}
+
+        Hi {creator_data['name']},
+
+        I've been following your {creator_data['category']} content on {creator_data['platform']} and I'm impressed by your engagement with your audience.
+
+        We're launching {campaign_data['title']} and think you'd be a perfect fit for our campaign targeting {campaign_data['audience']}.
+
+        Campaign Details:
+        {campaign_data.get('enhanced_brief', campaign_data['brief'])}
+
+        Budget: {campaign_data['budget']} INR
+        Platform: {platform_text}
+
+        Would you be interested in discussing this collaboration opportunity?
+
+        Best regards,
+        CreatorFlow AI Team"""
+
+        fallback_voice = f"Hi {creator_data['name']}, I've been following your {creator_data['category']} content and think you'd be perfect for our {campaign_data['title']} campaign. Would you be interested in discussing a collaboration?"
+        
+        return fallback_email, fallback_voice
+    
 # 1. CAMPAIGN CREATION ROUTES
 @app.post("/api/campaigns", response_model=Campaign)
 async def create_campaign(campaign: CampaignCreate):
@@ -247,7 +392,7 @@ async def enhance_campaign_brief(campaign_id: str):
     Platforms: {platform_text}
     Original Brief: {campaign_data['brief']}
 
-    Please rewrite it as an engaging influencer brief.
+    Please rewrite it as an engaging influencer brief and do not include the brand name if it is not mentioned.
     """
 
     response = client.chat.completions.create(
@@ -347,7 +492,6 @@ async def ai_search_creators(request: CreatorSearchRequest):
         }
     
     try:
-        # Prepare all creators data for single LLM call
         creators_text = ""
         for idx, creator in enumerate(all_creators):
             creators_text += f"""
@@ -362,7 +506,6 @@ async def ai_search_creators(request: CreatorSearchRequest):
             - Description: {creator['description']}
             """
         
-        # Single comprehensive LLM call for everything
         comprehensive_prompt = f"""
         You are an elite influencer marketing AI analyst. Analyze this campaign and score ALL creators in a single response.
         
@@ -438,7 +581,6 @@ async def ai_search_creators(request: CreatorSearchRequest):
         - Ensure valid JSON format
         """
         
-        # Single LLM call
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -446,7 +588,7 @@ async def ai_search_creators(request: CreatorSearchRequest):
                 {"role": "user", "content": comprehensive_prompt}
             ],
             temperature=0.1,
-            max_tokens=4000  # Increased for comprehensive analysis
+            max_tokens=4000 
         )
         
         import json
@@ -462,7 +604,6 @@ async def ai_search_creators(request: CreatorSearchRequest):
                 creator_with_score = all_creators[creator_idx].copy()
                 creator_with_score["match_score"] = score_data.get("match_score", 50)
                 
-                # Optional: Add additional analysis data if needed
                 creator_with_score["ai_insights"] = {
                     "strengths": score_data.get("strengths", []),
                     "collaboration_fit": score_data.get("collaboration_fit", "fair"),
@@ -474,8 +615,6 @@ async def ai_search_creators(request: CreatorSearchRequest):
         
         # Sort by match_score (highest first)
         scored_creators.sort(key=lambda x: x.get("match_score", 0), reverse=True)
-        
-        # Get semantic matches from analysis
         semantic_matches = analysis_result.get("semantic_matches", [])
         
         return {
@@ -485,7 +624,7 @@ async def ai_search_creators(request: CreatorSearchRequest):
         }
         
     except Exception as e:
-        print(f"Single LLM call failed: {str(e)}")
+        print(f"LLM call failed for AI Search: {str(e)}")
         
         # Enhanced fallback with multi-criteria matching
         query_words = set(query.lower().split())
@@ -534,51 +673,43 @@ async def ai_search_creators(request: CreatorSearchRequest):
             "semantic_matches": fallback_semantic
         }
 
-# 3. AI OUTREACH ROUTES
-@app.post("/api/outreach", response_model=OutreachResponse)
-async def generate_outreach(request: OutreachRequest):
+@app.post("/api/outreach", response_model=SimpleOutreachResponse)
+async def generate_outreach(request: SimpleOutreachRequest):
     """Generate AI-powered outreach email and voice message"""
+    
+    # Get campaign data
     campaign_data = await get_campaign_from_db(request.campaign_id)
     if not campaign_data:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    # Handle multiple platforms in outreach
-    platform_text = ", ".join(campaign_data["platforms"]) if len(campaign_data["platforms"]) > 1 else campaign_data["platforms"][0]
+    # Get creator data
+    creator_data = await get_creator_from_db(request.creator_id)
+    if not creator_data:
+        raise HTTPException(status_code=404, detail="Creator not found")
     
-    # Simulate GPT-4 outreach generation
-    email_content = f"""Subject: Exciting Collaboration Opportunity - {campaign_data['title']}
-
-Hi there!
-
-I hope this message finds you well. I've been following your content and I'm impressed by your authentic voice and engagement with your {campaign_data['audience']} audience.
-
-We're launching an exciting campaign for {campaign_data['title']} across {platform_text}, and I believe your creative style would be a perfect fit for our brand.
-
-Campaign Brief: {campaign_data['brief']}
-
-Budget: {campaign_data['budget']} INR
-
-Would you be interested in discussing a collaboration? We're offering competitive rates and flexible creative freedom.
-
-Looking forward to hearing from you!
-
-Best regards,
-CreatorFlow AI Team"""
+    # Generate content
+    email_content, voice_script = await generate_simple_outreach_content(campaign_data, creator_data)
     
-    # Simulate ElevenLabs voice generation
-    audio_url = f"/api/audio/outreach_{request.campaign_id}_{request.creator_id}.mp3"
+    # Generate voice message
+    audio_url = await generate_simple_voice_message(voice_script, request.campaign_id, request.creator_id)
     
+    # Store in database using your existing schema
     outreach_data = {
         "campaign_id": request.campaign_id,
         "creator_id": request.creator_id,
-        "email_content": email_content,
+        "outreach_text": email_content,  # This maps to your 'outreach_text' column
         "audio_url": audio_url,
         "created_at": datetime.now().isoformat()
     }
     
-    await create_outreach_in_db(outreach_data)
+    try:
+        result = supabase.table("outreach").insert(outreach_data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create outreach")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
-    return OutreachResponse(
+    return SimpleOutreachResponse(
         email_content=email_content,
         audio_url=audio_url
     )
@@ -586,11 +717,91 @@ CreatorFlow AI Team"""
 @app.get("/api/outreach/{campaign_id}/{creator_id}")
 async def get_outreach(campaign_id: str, creator_id: str):
     """Get outreach details"""
-    outreach_data = await get_outreach_from_db(campaign_id, creator_id)
-    if not outreach_data:
-        raise HTTPException(status_code=404, detail="Outreach not found")
+    try:
+        result = supabase.table("outreach").select("*").eq("campaign_id", campaign_id).eq("creator_id", creator_id).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Outreach not found")
+        
+        outreach_data = result.data[0]
+        return {
+            "id": outreach_data["id"],
+            "campaign_id": outreach_data["campaign_id"],
+            "creator_id": outreach_data["creator_id"],
+            "email_content": outreach_data["outreach_text"],
+            "audio_url": outreach_data["audio_url"],
+            "created_at": outreach_data["created_at"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/outreach/campaign/{campaign_id}")
+async def get_campaign_outreach(campaign_id: str):
+    """Get all outreach for a campaign"""
+    try:
+        result = supabase.table("outreach").select("*").eq("campaign_id", campaign_id).execute()
+        return {"outreach": result.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.post("/api/outreach/batch")
+async def generate_batch_outreach(campaign_id: str, creator_ids: List[str]):
+    """Generate outreach for multiple creators"""
     
-    return outreach_data
+    campaign_data = await get_campaign_from_db(campaign_id)
+    if not campaign_data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    
+    results = []
+    
+    for creator_id in creator_ids:
+        try:
+            creator_data = await get_creator_from_db(creator_id)
+            if not creator_data:
+                results.append({
+                    "creator_id": creator_id,
+                    "status": "error",
+                    "message": "Creator not found"
+                })
+                continue
+            
+            # Generate content
+            email_content, voice_script = await generate_simple_outreach_content(campaign_data, creator_data)
+            
+            # Generate voice (you can skip this for batch to save API costs)
+            audio_url = f"/api/audio/batch_outreach_{campaign_id}_{creator_id}.mp3"
+            
+            # Store data
+            outreach_data = {
+                "campaign_id": campaign_id,
+                "creator_id": creator_id,
+                "outreach_text": email_content,
+                "audio_url": audio_url,
+                "created_at": datetime.now().isoformat()
+            }
+            
+            supabase.table("outreach").insert(outreach_data).execute()
+            
+            results.append({
+                "creator_id": creator_id,
+                "status": "success"
+            })
+            
+        except Exception as e:
+            results.append({
+                "creator_id": creator_id,
+                "status": "error",
+                "message": str(e)
+            })
+    
+    return {
+        "campaign_id": campaign_id,
+        "total_creators": len(creator_ids),
+        "results": results,
+        "success_count": len([r for r in results if r["status"] == "success"])
+    }
+
 
 # 4. VOICE NEGOTIATION ROUTES
 @app.post("/api/negotiations/transcribe")
