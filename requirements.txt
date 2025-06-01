@@ -12,3 +12,4 @@ uuid
 python-dateutil
 supabase
 python-dotenv
+reportlab
